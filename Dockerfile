@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.22-alpine AS build
+FROM golang:1.24.4 as build
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download

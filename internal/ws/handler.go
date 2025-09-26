@@ -1,116 +1,229 @@
-// internal/ws/handler.go
 package ws
 
 import (
-	"errors"
+	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/config"
-	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/logs"
-	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/rooms"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+
+	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/hub"
+	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/metrics"
 )
 
-var up = websocket.Upgrader{
-	ReadBufferSize:  32 << 10,
-	WriteBufferSize: 32 << 10,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+type wsOpts struct {
+	readBuf, writeBuf int
+	maxMsg            int64
+	heartbeat         time.Duration
+	rl                interface{ AllowWS(*http.Request) bool } // nil => no limit
+}
+type Option func(*wsOpts)
+
+func WithRateLimiter(rl interface{ AllowWS(*http.Request) bool }) Option {
+	return func(o *wsOpts) { o.rl = rl }
 }
 
-type wireMsg struct {
-	Type string      `json:"type"`
-	To   string      `json:"to,omitempty"`
-	Data interface{} `json:"data,omitempty"`
+func WithBuffers(read, write int) Option {
+	return func(o *wsOpts) { o.readBuf, o.writeBuf = read, write }
+}
+func WithLimits(max int64, heartbeat time.Duration) Option {
+	return func(o *wsOpts) { o.maxMsg, o.heartbeat = max, heartbeat }
 }
 
-func NewHandler(cfg config.Config, log logs.Logger, store *rooms.Store) http.Handler {
-	l := log.Named("ws")
+// originAllowed checks if the Origin header is in the allowlist.
+// - Empty Origin (non-browser clients) is allowed.
+// - Items in allowedOrigins can be full origins (https://example.com) or hostnames (example.com).
+func originAllowed(allowedOrigins []string, origin string) bool {
+	if origin == "" {
+		return true // non-browser clients typically omit Origin
+	}
+	if len(allowedOrigins) == 0 {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	for _, a := range allowedOrigins {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		// exact origin match
+		if strings.EqualFold(a, origin) {
+			return true
+		}
+		// hostname match
+		if strings.EqualFold(a, host) {
+			return true
+		}
+	}
+	return false
+}
+
+func NewWSHandler(h *hub.Hub, allowedOrigins []string, lg *slog.Logger, dev bool, options ...Option) http.Handler {
+	if lg == nil {
+		lg = slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
+	cfg := wsOpts{readBuf: 64 << 10, writeBuf: 64 << 10, maxMsg: 1 << 20, heartbeat: 60 * time.Second}
+	for _, opt := range options {
+		opt(&cfg)
+	}
+	pingPeriod := cfg.heartbeat * 9 / 10
+
+	allow := make(map[string]struct{}, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allow[o] = struct{}{}
+	}
+
+	up := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			if dev {
+				return true
+			}
+			_, ok := allow[r.Header.Get("Origin")]
+			return ok
+		},
+		ReadBufferSize:  cfg.readBuf,
+		WriteBufferSize: cfg.writeBuf,
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !websocket.IsWebSocketUpgrade(r) {
-			w.Header().Set("Connection", "Upgrade")
-			w.Header().Set("Upgrade", "websocket")
-			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
-			return
-		}
-
 		appID := r.URL.Query().Get("appID")
-		side := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("side")))
-		if _, err := uuid.Parse(appID); err != nil || (side != "A" && side != "B") {
-			http.Error(w, "bad query", http.StatusBadRequest)
+		if _, err := uuid.Parse(appID); err != nil {
+			http.Error(w, "invalid appID", http.StatusBadRequest)
 			return
 		}
+		side := r.URL.Query().Get("side")
+		if side != "A" && side != "B" {
+			http.Error(w, "invalid side", http.StatusBadRequest)
+			return
+		}
+		sessionID := r.URL.Query().Get("sid")
 
-		c, err := up.Upgrade(w, r, nil)
+		if !dev && !originAllowed(allowedOrigins, r.Header.Get("Origin")) {
+			http.Error(w, "forbidden origin", http.StatusForbidden)
+			return
+		}
+		if cfg.rl != nil && !cfg.rl.AllowWS(r) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		conn, err := up.Upgrade(w, r, nil)
 		if err != nil {
-			l.Warn("upgrade failed", logs.F("err", err))
+			lg.Warn("ws upgrade failed", "err", err)
 			return
 		}
-		l.Info("ws-upgraded", logs.F("remote", r.RemoteAddr), logs.F("appID", appID), logs.F("side", side))
-		defer func() {
-			l.Info("ws-closed", logs.F("remote", r.RemoteAddr), logs.F("appID", appID), logs.F("side", side))
-			_ = c.Close()
-		}()
-
-		// deadlines / heartbeat
-		_ = c.SetReadDeadline(time.Now().Add(cfg.Handshake))
-		c.SetPongHandler(func(string) error {
-			_ = c.SetReadDeadline(time.Now().Add(cfg.Heartbeat * 2))
+		defer conn.Close()
+		metrics.WSConnections.Inc()
+		conn.SetReadLimit(cfg.maxMsg)
+		_ = conn.SetReadDeadline(time.Now().Add(cfg.heartbeat))
+		conn.SetPongHandler(func(data string) error {
+			if err := conn.SetReadDeadline(time.Now().Add(cfg.heartbeat)); err != nil {
+				return err
+			}
+			if ts, err := strconv.ParseInt(data, 10, 64); err == nil {
+				metrics.WSRTTSeconds.Observe(time.Since(time.Unix(0, ts)).Seconds())
+			}
 			return nil
 		})
-		ticker := time.NewTicker(cfg.Heartbeat)
-		defer ticker.Stop()
+
+		if err := h.Register(appID, side, sessionID, conn); err != nil {
+			lg.Warn("hub register failed", "err", err, "appID", appID, "side", side)
+			_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, err.Error()))
+			return
+		}
+		defer h.Unregister(appID, conn)
+
+		if h.RoomSize(appID) == 2 {
+			h.BroadcastEvent(appID, map[string]any{"type": "room_full"})
+		}
+
 		go func() {
-			for range ticker.C {
-				_ = c.WriteControl(websocket.PingMessage, []byte(""), time.Now().Add(2*time.Second))
+			t := time.NewTicker(pingPeriod)
+			defer t.Stop()
+			for range t.C {
+				payload := []byte(strconv.FormatInt(time.Now().UnixNano(), 10))
+				if err := h.Ping(appID, side, payload); err != nil {
+					_ = conn.Close()
+					return
+				}
 			}
 		}()
 
-		// ---------- AUTO-JOIN HAPPENS HERE (no reads before this) ----------
-		l.Info("JOIN-BEFORE", logs.F("appID", appID), logs.F("side", side), logs.F("size", store.RoomSize(appID)))
-
-		self, _, err := store.Join(appID, side, c)
-		if err == rooms.ErrRoomFull {
-			_ = c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(1008, "room-full"), time.Now().Add(1*time.Second))
-			l.Info("join-rejected-room-full", logs.F("appID", appID), logs.F("side", side))
-			return
-		}
-		if err != nil {
-			l.Warn("join-failed", logs.F("appID", appID), logs.F("side", side), logs.F("err", err))
-			return
-		}
-
-		after := store.RoomSize(appID)
-		l.Info("JOIN-AFTER", logs.F("appID", appID), logs.F("peer", self), logs.F("side", side), logs.F("size", after))
-
-		if after == 2 {
-			l.Info("ROOM_FULL_EMIT", logs.F("appID", appID))
-			store.Broadcast(appID, map[string]any{"type": "room_full"})
-		}
-
-		_ = c.SetReadDeadline(time.Now().Add(cfg.Heartbeat * 2))
-
-		// read/relay
 		for {
-			var msg wireMsg
-			if err := c.ReadJSON(&msg); err != nil {
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) || errors.Is(err, io.EOF) {
-					break
+			mt, msg, err := conn.ReadMessage()
+			if err != nil {
+				// quiet on normal closes
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					lg.Warn("ws read error", "err", err)
 				}
-				break
+				return
 			}
-			if msg.Type == "signal" {
-				store.Relay(appID, self, msg.To, msg.Data)
+			metrics.WSFrameSize.WithLabelValues("in").Observe(float64(len(msg)))
+			if mt != websocket.TextMessage && mt != websocket.BinaryMessage {
+				continue
 			}
-			// ignore everything else (hello, etc.)
+			var peek struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(msg, &peek); err != nil {
+				continue
+			}
+			t := strings.ToLower(peek.Type)
+			if t == "" {
+				t = "unknown"
+			}
+			metrics.SignalMsg.WithLabelValues(t).Inc()
+			metrics.SignalBytes.WithLabelValues("in", t).Add(float64(len(msg)))
+			switch t {
+			case "offer", "answer", "ice":
+				metrics.WSFrameSize.WithLabelValues("out").Observe(float64(len(msg)))
+				metrics.SignalBytes.WithLabelValues("out", t).Add(float64(len(msg)))
+				h.Broadcast(appID, conn, msg)
+			case "hello":
+				var m struct {
+					DeliveredUpTo uint64 `json:"deliveredUpTo"`
+				}
+				if err := json.Unmarshal(msg, &m); err == nil {
+					h.Hello(appID, side, sessionID, m.DeliveredUpTo)
+				}
+			case "send":
+				var m struct {
+					To      string          `json:"to"`
+					Payload json.RawMessage `json:"payload"`
+				}
+				if err := json.Unmarshal(msg, &m); err == nil {
+					_ = h.Enqueue(appID, side, strings.ToUpper(m.To), m.Payload)
+				}
+			//{"type":"telemetry","event":"ice-connected"}
+			case "telemetry":
+				var tm struct {
+					Event  string `json:"event"`
+					Reason string `json:"reason"`
+				}
+				_ = json.Unmarshal(msg, &tm)
+				switch strings.ToLower(tm.Event) {
+				case "ice-connected":
+					if dt, first := h.MarkEstablished(appID); first {
+						metrics.SessionEstablished.Inc()
+						metrics.SessionTTF.Observe(dt.Seconds())
+					}
+				case "ice-failed":
+					metrics.SessionFailed.WithLabelValues("ice-failed").Inc()
+				default:
+					// no-op
+				}
+			default:
+				// ignore
+			}
 		}
-
-		// cleanup
-		store.Leave(appID, self)
-		store.Broadcast(appID, map[string]any{"type": "peer-left", "peerId": self})
 	})
 }

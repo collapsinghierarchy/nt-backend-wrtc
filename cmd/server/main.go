@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,109 +12,75 @@ import (
 
 	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/config"
 	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/health"
+	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/hub"
 	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/logs"
 	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/metrics"
-	rendezvous "github.com/collapsinghierarchy/nt-backend-wrtc/internal/rendezvouz"
-	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/rooms"
+	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/middleware"
+	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/rendezvous"
 	"github.com/collapsinghierarchy/nt-backend-wrtc/internal/ws"
-	"go.uber.org/zap"
 )
 
 func main() {
-	cfg := config.FromEnv()
-	logger := logs.New(cfg.LogLevel)
-	defer logger.Sync()
+	// 1) Config + logger
+	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		log.Fatal(err)
+	}
+	logger := logs.New("srv")
 
-	metrics.Init()
-
-	store := rooms.NewStore(cfg, logger)
-	defer store.Close()
-
-	// rendezvous store for 4-digit codes -> appID (UUID)
-	rv := rendezvous.NewStore(cfg.RoomTTL)
-
+	wsRL := middleware.New(cfg.WSRatePerMin)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// 2) Mux + core endpoints
 	mux := http.NewServeMux()
-	// Health + readiness
 	mux.Handle("/healthz", health.Healthz())
 	mux.Handle("/readyz", health.Readyz())
-
-	// Metrics
 	mux.Handle(cfg.MetricsRoute, metrics.Handler())
 
-	// Info
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"name":"nt-backend-wrtc","ok":true}`))
-	})
+	// 3) Rendezvous API (rate-limited if configured)
+	rz := rendezvous.NewStore(cfg.RoomTTL)
+	rz.StartJanitor(ctx)
+	rzHandler := http.StripPrefix("/rendezvous", rz.Routes())
+	httpRL := middleware.New(cfg.HTTPRatePerMin)
+	rzHandler = httpRL.Middleware()(rzHandler)
+	mux.Handle("/rendezvous/", rzHandler)
 
-	// Mint rendezvous code
-	mux.HandleFunc("/rendezvous/code", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		code, appID, exp, err := rv.CreateCode(r.Context())
-		if err != nil {
-			logger.Error("rv create code failed", logs.F("err", err))
-			http.Error(w, "internal", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"code":      code,
-			"appID":     appID,
-			"expiresAt": exp.UTC().Format(time.RFC3339),
-		})
-	})
+	// 4) WebSocket signaling (big-handler compatible) + WS rate limit + tuning
+	h := hub.New()
+	wsHandler := ws.NewWSHandler(
+		h,
+		cfg.CORSOrigins, // exact origins; ignored when DevMode=true
+		nil,             // use handler's default slog logger
+		cfg.DevMode,     // allow all origins in dev
+		ws.WithBuffers(cfg.WSReadBuf, cfg.WSWriteBuf),
+		ws.WithLimits(cfg.WSMaxMsg, cfg.Heartbeat),
+		ws.WithRateLimiter(wsRL),
+	)
+	mux.Handle("/ws", wsHandler)
 
-	// Redeem rendezvous code -> appID
-	mux.HandleFunc("/rendezvous/redeem", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			Code string `json:"code"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Code) == 0 {
-			http.Error(w, "bad_json", http.StatusBadRequest)
-			return
-		}
-		appID, exp, ok := rv.RedeemCode(r.Context(), body.Code)
-		if !ok {
-			http.Error(w, "not_found_or_expired", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"appID":     appID,
-			"expiresAt": exp.UTC().Format(time.RFC3339),
-		})
-	})
-
-	// WS: must include ?appID=<uuid>&side=A|B
-	mux.Handle("/ws", ws.NewHandler(cfg, logger, store))
-
+	// 5) HTTP server with timeouts
 	srv := &http.Server{
 		Addr:              cfg.BindAddr(),
-		Handler:           logs.RequestLogger(logger, mux),
-		ReadHeaderTimeout: 5 * time.Second,
+		Handler:           logs.Middleware(logger)(mux),
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 
+	// 6) Serve (TLS if cert+key are set)
 	go func() {
-		logger.Info("listening", logs.F("addr", cfg.BindAddr()))
-		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			logger.Fatal("server error", zap.Error(err))
+		var err error
+		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+			err = srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
 		}
 	}()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	<-ctx.Done()
-	stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
-	logger.Info("bye")
 }

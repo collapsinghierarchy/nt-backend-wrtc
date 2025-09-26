@@ -8,7 +8,6 @@ func Healthz() http.Handler {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 }
-
 func Readyz() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
