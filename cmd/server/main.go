@@ -68,19 +68,31 @@ func main() {
 	}
 
 	// 6) Serve (TLS if cert+key are set)
+	errCh := make(chan error, 1)
 	go func() {
 		var err error
 		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+			log.Printf("serving HTTPS on %s", cfg.BindAddr())
 			err = srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
 		} else {
+			log.Printf("serving HTTP on %s", cfg.BindAddr())
 			err = srv.ListenAndServe()
 		}
-		if !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
-		}
+		errCh <- err
 	}()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	// 7) Block until we’re told to stop (signal) or the server fails
+	select {
+	case <-ctx.Done():
+		// graceful shutdown
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown error: %v", err)
+		}
+	case err := <-errCh:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	}
 }

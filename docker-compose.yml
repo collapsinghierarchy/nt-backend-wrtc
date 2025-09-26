@@ -6,30 +6,39 @@ services:
     image: nt-backend-wrtc:local
     restart: unless-stopped
     environment:
+      # --- network ---
       - HOST=0.0.0.0
       - PORT=1234
+
+      # --- rendezvous ---
       - ROOM_TTL=10m
+
+      # --- websocket ---
       - WS_HEARTBEAT=20s
       - WS_HANDSHAKE=5m
       - WS_READ_BUFFER=65536
       - WS_WRITE_BUFFER=65536
       - WS_MAX_MSG=1048576
-      - METRICS_ROUTE=/metrics
-      - DEV=true
-      # --- timeouts ---
-      - READ_HEADER_TIMEOUT=5s
-      - WRITE_TIMEOUT=0s
       - IDLE_TIMEOUT=0s
+
       # --- rate limits (0 disables) ---
       - WS_RATE_PER_MIN=0
       - HTTP_RATE_PER_MIN=0
+
       # --- TLS (optional) ---
       # - TLS_CERT_FILE=/certs/server.crt
       # - TLS_KEY_FILE=/certs/server.key
+
+      # --- origin policy ---
+      # - DEV=true                          # allow all origins
+      # - CORS_ORIGINS=https://example.com  # prod allowlist
+
     ports:
       - "1234:1234"
+
+    # Distroless has no curl/wget; do the healthcheck from the host network using 'CMD-SHELL'
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:1234/readyz"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:1234/readyz || exit 1"]
       interval: 10s
       timeout: 2s
       retries: 5

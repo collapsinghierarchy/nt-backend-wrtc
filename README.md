@@ -204,12 +204,12 @@ services:
 
 ## License
 
-TODO
+Apache License Version 2.0,
 
 ---
 
 ## FAQ
 
-* **Why 4‑digit codes?** Small UX footprint. The store reclaims expired slots and prevents reuse during TTL; expand to 6 digits by changing one modulus/format string.
+* **Why 4‑digit codes?** Small UX footprint. The store reclaims expired slots and prevents reuse during TTL; expand to 6 digits by changing one modulus/format string; Not relevant for security.
 * **Do I need telemetry frames?** No; they only enrich metrics (`time_to_first`).
 * **Why not JWT/auth now?** Kept minimal by design; can be added behind a proxy or via middleware with little surface change.
