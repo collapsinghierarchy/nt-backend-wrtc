@@ -1,7 +1,7 @@
 version: "3.8"
 
 services:
-  rendezvous:
+  nt-backend:
     build: .
     image: nt-backend-wrtc:local
     restart: unless-stopped
@@ -32,9 +32,13 @@ services:
       # --- origin policy ---
       # - DEV=true                          # allow all origins
       # - CORS_ORIGINS=https://example.com  # prod allowlist
-
-    ports:
-      - "1234:1234"
+    expose:
+      - "8080"                 # visible to other containers only
+    networks:
+      web:
+        aliases: [nt-backend]            # stable DNS name on 'web'
+      observability:
+        aliases: [nt-backend]            # stable DNS name on 'observability'
 
     # Distroless has no curl/wget; do the healthcheck from the host network using 'CMD-SHELL'
     healthcheck:
@@ -42,3 +46,11 @@ services:
       interval: 10s
       timeout: 2s
       retries: 5
+
+networks:
+  web:
+    external: true
+    name: whitenoise_web
+  observability:
+    external: true
+    name: whitenoise_observability
