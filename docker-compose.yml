@@ -4,11 +4,13 @@ services:
   nt-backend:
     build: .
     image: nt-backend-wrtc:local
+    container_name: nt-backend
     restart: unless-stopped
+
     environment:
       # --- network ---
       - HOST=0.0.0.0
-      - PORT=1234
+      - PORT=1234            # app HTTP port
 
       # --- rendezvous ---
       - ROOM_TTL=10m
@@ -32,20 +34,20 @@ services:
       # --- origin policy ---
       # - DEV=true                          # allow all origins
       # - CORS_ORIGINS=https://example.com  # prod allowlist
+
+    # Internal-only visibility for other containers (nginx, prometheus, etc.)
     expose:
-      - "8080"                 # visible to other containers only
+      - "8080"   # app HTTP
+
     networks:
       web:
-        aliases: [nt-backend]            # stable DNS name on 'web'
+        aliases: [nt-backend]
       observability:
-        aliases: [nt-backend]            # stable DNS name on 'observability'
+        aliases: [nt-backend]
 
-    # Distroless has no curl/wget; do the healthcheck from the host network using 'CMD-SHELL'
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:1234/readyz || exit 1"]
-      interval: 10s
-      timeout: 2s
-      retries: 5
+    # NOTE: removed healthcheck — distroless has no shell/curl.
+    # If you really need one, add a tiny probe binary in your image
+    # and use ["CMD", "/probe", "--addr=127.0.0.1:1234"] or similar.
 
 networks:
   web:
