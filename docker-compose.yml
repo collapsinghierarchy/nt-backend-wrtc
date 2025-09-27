@@ -10,7 +10,7 @@ services:
     environment:
       # --- network ---
       - HOST=0.0.0.0
-      - PORT=1234            # app HTTP port
+      - PORT=8080           # app HTTP port
 
       # --- rendezvous ---
       - ROOM_TTL=10m
