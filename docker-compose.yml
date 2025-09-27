@@ -11,7 +11,7 @@ services:
       # --- network ---
       - HOST=0.0.0.0
       - PORT=8080           # app HTTP port
-      - ALLOWED_ORIGINS=https://nt.whitenoise.systems,https://whitenoise.systems
+      #- ALLOWED_ORIGINS=https://nt.whitenoise.systems,https://whitenoise.systems
       # --- rendezvous ---
       - ROOM_TTL=10m
 
