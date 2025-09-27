@@ -43,9 +43,8 @@ func originAllowed(allowedOrigins []string, origin string) bool {
 	if origin == "" {
 		return true // non-browser clients typically omit Origin
 	}
-	// by default no blocks.
 	if len(allowedOrigins) == 0 {
-		return true
+		return false
 	}
 	u, err := url.Parse(origin)
 	if err != nil {
@@ -79,18 +78,14 @@ func NewWSHandler(h *hub.Hub, allowedOrigins []string, lg *slog.Logger, dev bool
 	}
 	pingPeriod := cfg.heartbeat * 9 / 10
 
-	allow := make(map[string]struct{}, len(allowedOrigins))
-	for _, o := range allowedOrigins {
-		allow[o] = struct{}{}
-	}
-
 	up := websocket.Upgrader{
+		// Use the same policy everywhere: allow empty Origin (CLI),
+		// allow full-origins or hostnames from allowedOrigins.
 		CheckOrigin: func(r *http.Request) bool {
 			if dev {
 				return true
 			}
-			_, ok := allow[r.Header.Get("Origin")]
-			return ok
+			return originAllowed(allowedOrigins, r.Header.Get("Origin"))
 		},
 		ReadBufferSize:  cfg.readBuf,
 		WriteBufferSize: cfg.writeBuf,
@@ -109,6 +104,7 @@ func NewWSHandler(h *hub.Hub, allowedOrigins []string, lg *slog.Logger, dev bool
 		}
 		sessionID := r.URL.Query().Get("sid")
 
+		// (Optional) for a clearer 403 body,
 		if !dev && !originAllowed(allowedOrigins, r.Header.Get("Origin")) {
 			http.Error(w, "forbidden origin", http.StatusForbidden)
 			return
