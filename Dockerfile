@@ -21,9 +21,9 @@ RUN CGO_ENABLED=0 \
 # Use the fully static base (smallest); use :base if you need certs/tools
 FROM gcr.io/distroless/static-debian12:nonroot
 
-# Keep the default port consistent with the project (1234)
-ENV PORT=1234
-EXPOSE 1234
+# Keep the default port consistent with the project (8080)
+ENV PORT=8080
+EXPOSE 8080
 
 COPY --from=build /out/nt-backend-wrtc /usr/local/bin/nt-backend-wrtc
 
