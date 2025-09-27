@@ -43,8 +43,9 @@ func originAllowed(allowedOrigins []string, origin string) bool {
 	if origin == "" {
 		return true // non-browser clients typically omit Origin
 	}
+	// by default no blocks.
 	if len(allowedOrigins) == 0 {
-		return false
+		return true
 	}
 	u, err := url.Parse(origin)
 	if err != nil {
@@ -112,6 +113,7 @@ func NewWSHandler(h *hub.Hub, allowedOrigins []string, lg *slog.Logger, dev bool
 			http.Error(w, "forbidden origin", http.StatusForbidden)
 			return
 		}
+
 		if cfg.rl != nil && !cfg.rl.AllowWS(r) {
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
