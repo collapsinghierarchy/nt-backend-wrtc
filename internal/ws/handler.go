@@ -182,7 +182,7 @@ func NewWSHandler(h *hub.Hub, allowedOrigins []string, lg *slog.Logger, dev bool
 			metrics.SignalMsg.WithLabelValues(t).Inc()
 			metrics.SignalBytes.WithLabelValues("in", t).Add(float64(len(msg)))
 			switch t {
-			case "offer", "answer", "ice":
+			case "offer", "answer", "ice", "sender_ready":
 				metrics.WSFrameSize.WithLabelValues("out").Observe(float64(len(msg)))
 				metrics.SignalBytes.WithLabelValues("out", t).Add(float64(len(msg)))
 				h.Broadcast(appID, conn, msg)
