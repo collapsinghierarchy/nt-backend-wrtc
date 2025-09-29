@@ -206,12 +206,17 @@ func NewWSHandler(h *hub.Hub, allowedOrigins []string, lg *slog.Logger, dev bool
 				var tm struct {
 					Event  string `json:"event"`
 					Reason string `json:"reason"`
+					Mode   string `json:"mode"`
 				}
 				_ = json.Unmarshal(msg, &tm)
+				mode := strings.ToLower(strings.TrimSpace(tm.Mode))
+				if mode == "" {
+					mode = "unspecified"
+				}
 				switch strings.ToLower(tm.Event) {
 				case "ice-connected":
 					if dt, first := h.MarkEstablished(appID); first {
-						metrics.SessionEstablished.Inc()
+						metrics.SessionEstablished.WithLabelValues(mode).Inc()
 						metrics.SessionTTF.Observe(dt.Seconds())
 					}
 				case "ice-failed":

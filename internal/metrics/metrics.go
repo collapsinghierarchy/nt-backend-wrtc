@@ -44,9 +44,9 @@ var (
 		Name: "nt_signal_bytes_total", Help: "Signaling payload bytes",
 	}, []string{"dir", "type"})
 
-	SessionEstablished = prometheus.NewCounter(prometheus.CounterOpts{
+	SessionEstablished = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nt_session_established_total", Help: "Sessions established (ICE connected)",
-	})
+	}, []string{"mode"})
 	SessionFailed = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nt_session_failed_total", Help: "Sessions failed",
 	}, []string{"reason"})
